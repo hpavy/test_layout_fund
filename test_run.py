@@ -42,7 +42,16 @@ tok = example['tokens']
 image = example["image"]
 labels = example["ner_tags"]
 box = example["bboxes"]
-encoding = tokenizer(image, tok, boxes=box, word_labels=labels, return_tensors="pt", truncation=True)
+encoding = tokenizer(image, tok, boxes=box, word_labels=labels, return_tensors="pt", truncation=True, padding=False)
 return_model = model(**encoding)
+
+#### we predict the label
+logits = return_model.logits
+proba = logits.softmax(dim=-1)
+indices_label = proba.max(-1).indices.squeeze()
+
+masque_special_item = ~(encoding["labels"]==-100).squeeze()
+predictions = indices_label[masque_special_item]   # we have the predicted labels 
+
 
 print('piche')
