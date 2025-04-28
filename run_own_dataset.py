@@ -1,16 +1,17 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+import os
+import json
+from PIL import Image
 from transformers import (
     LayoutLMv3Processor,
     LayoutLMv3ForTokenClassification,
 )
-import torch
-import torch.optim as optim
-from datasets import load_dataset
 
-
-# charge the dataset
-dataset = load_dataset(
-        "nielsr/funsd-layoutlmv3",
-        )
+LABELS = ["other", "header", "question", "answer"]
+LABELS2ID = {label: id for id, label in enumerate(LABELS)}
+ID2LABELS = {id: label for id, label in enumerate(LABELS)}
 
 
 # the arguments for the training
@@ -42,11 +43,11 @@ def compute_accuracy(result, encoding):
 
 # charge the tokenizer and the model
 tokenizer = LayoutLMv3Processor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)  # apply_ocr is false because we already have the text inside the boxes
-model = LayoutLMv3ForTokenClassification.from_pretrained("microsoft/layoutlmv3-base", num_labels=7, hidden_dropout_prob=hidden_dropout_prob)
-
+model = LayoutLMv3ForTokenClassification.from_pretrained("microsoft/layoutlmv3-base", num_labels=4, hidden_dropout_prob=hidden_dropout_prob)
 
 # charge an optimizer
 optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
 
 
 # Preprocessing for the dataset
@@ -62,16 +63,65 @@ def tokenize_function(example):
         )
 
 
-tokenized_datasets_train = dataset["train"].map(tokenize_function, batched=True)
-tokenized_datasets_test = dataset["test"].map(tokenize_function, batched=True)
+class CustomDataset(Dataset):
+    def __init__(self, path):
+        """
+        Args:
+            data (list or array-like): Input data.
+            labels (list or array-like): Corresponding labels for the data.
+        """
+        self.path = path
+        self.list_files = [name_file[:-5] for name_file in os.listdir(path+"/annotations")]
+
+    def __len__(self):
+        """Return the total number of samples."""
+        return len(self.list_files)
+
+    def _get_annotations_unencode(self, idx):
+        with open(self.path + "/annotations/" + self.list_files[idx] + ".json", 'r') as file:
+            data = json.load(file)["form"]
+        boxs = []
+        tokens = []
+        labels = []
+        for element in data:
+            for mini_box in element["words"]:
+                tokens.append(mini_box["text"])
+                boxs.append(element["box"])  # we give coordinate of the big box
+                labels.append(LABELS2ID[element["label"]])
+        return tokens, boxs, labels
+
+    def _get_image(self, idx):
+        image = Image.open(self.path + "/images/" + self.list_files[idx] + ".png")
+        return image.convert("RGB")
+
+    def __getitem__(self, idx):
+        tokens, boxs, labels = self._get_annotations_unencode(idx)
+        image = self._get_image(idx)
+        return tokenizer(
+            image,
+            tokens,
+            boxes=boxs,
+            word_labels=labels,
+            return_tensors="pt",
+            truncation=True,
+            padding=True
+            )
+
+
+
+
+
 
 # we put everything on the gpu
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model.to(device)
 
 # for now we don't use any batch_size
-train_dataloader = tokenized_datasets_train
-test_dataloader = tokenized_datasets_test
+dataset_training = CustomDataset("test_layout_fund/dataset/training_data")
+train_dataloader = DataLoader(dataset_training, shuffle=True)
+
+dataset_test = CustomDataset("test_layout_fund/dataset/testing_data")
+test_dataloader = DataLoader(dataset_test)
 
 # the training loop
 nb_batch = len(train_dataloader)
@@ -83,12 +133,7 @@ for epoch in range(num_epochs):
     loss_batch_test = 0
     accuracy = 0
     for nb, batch_test in enumerate(test_dataloader):
-        tok = batch_test['tokens']
-        image = batch_test["image"]
-        labels = batch_test["ner_tags"]
-        box = batch_test["bboxes"]
-        encoding = tokenizer(image, tok, boxes=box, word_labels=labels, return_tensors="pt", truncation=True, padding=False)
-        encoding = {k: v.to(device) for k, v in encoding.items()}
+        encoding = {k: v[0].to(device) for k, v in batch_test.items()} # because we have just one batch
         return_model = model(**encoding)
         loss, result = return_model.values()
         loss_batch_test += loss.item()
@@ -105,12 +150,7 @@ for epoch in range(num_epochs):
     # accuracy = 0
     ########
     for batch in train_dataloader:
-        tok = batch['tokens']
-        image = batch["image"]
-        labels = batch["ner_tags"]
-        box = batch["bboxes"]
-        encoding = tokenizer(image, tok, boxes=box, word_labels=labels, return_tensors="pt", truncation=True, padding=False)
-        encoding = {k: v.to(device) for k, v in encoding.items()}
+        encoding = {k: v[0].to(device) for k, v in batch.items()}  # because we have just one batch
         return_model = model(**encoding)
         loss, result = return_model.values()
         loss_batch += loss.item()
